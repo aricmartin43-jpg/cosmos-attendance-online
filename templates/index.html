@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cosmos Attendance</title>
+  <meta name="description" content="Employee attendance for Cosmos Engineering Solutions.">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="login-view" class="login-layout">
+    <aside class="brand-panel">
+      <div class="brand"><span class="brand-mark">C</span><span>COSMOS<small>ENGINEERING SOLUTIONS</small></span></div>
+      <div class="brand-story"><span class="eyebrow">PEOPLE · PRECISION · PROGRESS</span><h1>Every day.<br>Every contribution.</h1><p>Your work starts here. Secure attendance for the people who keep Cosmos moving.</p><div class="brand-rule"></div><span class="brand-caption">ATTENDANCE / EMPLOYEE PORTAL</span></div>
+      <p class="brand-footer">Cosmos Engineering Solutions · Coimbatore</p>
+    </aside>
+    <main class="login-main"><div class="login-card"><span class="eyebrow accent">COSMOS ATTENDANCE</span><h2>Welcome to work.</h2><p class="muted">Sign in to mark your attendance or manage your team.</p>
+      <form id="login-form"><label>Employee ID<input name="code" autocomplete="username" required placeholder="e.g. CES001"></label><label>Password<input name="password" type="password" autocomplete="current-password" required placeholder="Your password"></label><button type="submit" class="primary wide">Sign in <span aria-hidden="true">→</span></button></form>
+      <p class="help">Need an account or a password reset?<br>Contact your Cosmos administrator.</p><div class="login-note"><span class="mini-icon">◎</span><p>Face verification and location are requested only when you mark attendance.</p></div>
+    </div></main>
+  </div>
+
+  <div id="app-view" class="app-layout" hidden>
+    <aside class="sidebar"><div class="brand"><span class="brand-mark">C</span><span>COSMOS<small>ATTENDANCE</small></span></div><span class="nav-label">WORKSPACE</span><nav id="navigation" aria-label="Main navigation"></nav><div class="sidebar-bottom"><div class="workspace-badge">CE</div><div>Cosmos Engineering<small>Solutions · Coimbatore</small></div></div></aside>
+    <div class="workspace"><header class="topbar"><span id="breadcrumb">Attendance</span><div class="account"><span id="account-name"></span><button class="text-button" id="logout">Sign out</button></div></header>
+    <main class="content">
+      <div class="page-heading"><div><span class="eyebrow accent">COSMOS ENGINEERING SOLUTIONS</span><h1 id="page-title">Attendance overview</h1><p id="page-subtitle" class="muted">A clear view of your team's working day.</p></div><div class="date-badge" id="today-label"></div></div>
+
+      <section id="overview-panel" class="panel-view" hidden>
+        <div class="stats"><article class="stat"><span>Active employees</span><strong id="stat-total">0</strong><small>Registered team members</small></article><article class="stat"><span>Checked in</span><strong id="stat-in">0</strong><small>Attendance recorded today</small></article><article class="stat"><span>At work</span><strong id="stat-working">0</strong><small>Open shifts from today</small></article><article class="stat"><span>Not checked in</span><strong id="stat-away">0</strong><small>Active team, no check-in today</small></article></div>
+        <div class="section-card"><div class="section-heading"><div><h2>Daily attendance</h2><p class="muted">Verified check-ins and recorded working hours.</p></div><label class="compact-label">Date<input type="date" id="day-filter"></label></div><div id="daily-table"></div></div>
+        <div class="quiet-banner"><span class="mini-icon">◎</span><div><strong>Attendance from anywhere</strong><p>GPS is recorded at each check-in and check-out. No factory boundary restrictions.</p></div></div>
+      </section>
+
+      <section id="employees-panel" class="panel-view" hidden><div class="section-card"><div class="section-heading"><div><h2>Your team</h2><p class="muted">Add employees, register faces and manage access.</p></div><button class="primary" id="add-employee">+ Add employee</button></div><div id="employee-table"></div></div></section>
+
+      <section id="reports-panel" class="panel-view" hidden><div class="section-card"><div class="section-heading"><div><h2>Monthly attendance</h2><p class="muted">Download a CSV for Excel or Google Sheets.</p></div><div class="report-controls"><label class="compact-label">Month<input type="month" id="month-filter"></label><button class="primary" id="export">↓ Export CSV</button></div></div><div id="monthly-table"></div></div><p class="help">Hours include the full time between check-in and check-out. Break deductions and payroll calculations are not included.</p></section>
+
+      <section id="checkin-panel" class="panel-view" hidden><div class="attendance-grid"><article class="section-card checkin-card"><span class="eyebrow accent">YOUR WORKING DAY</span><h2 id="greeting">Hello</h2><div class="clock" id="clock">--:--</div><p id="employee-status" class="status-text">Loading attendance…</p><button class="primary wide" id="start-attendance">Mark attendance</button><div class="steps"><span>01 · Camera</span><span>02 · Location</span><span>03 · Verify</span></div></article><article class="section-card details-card"><span class="eyebrow">HOW IT WORKS</span><h2>A moment to check in.</h2><ol><li><strong>Face the camera</strong><p>Use good lighting. Only your face should be visible.</p></li><li><strong>Allow location access</strong><p>Work from any location. GPS is saved with your attendance.</p></li><li><strong>Capture and confirm</strong><p>Your face is checked against your registered photo before attendance is saved.</p></li></ol><p class="help">Photos are stored privately. Location is collected only when you submit attendance.</p></article></div><div class="section-card"><div class="section-heading"><h2>Today's attendance</h2></div><div id="my-table"></div></div></section>
+    </main><footer class="app-footer">COSMOS ATTENDANCE <span>Company time zone: <span id="timezone-label">Asia/Kolkata</span></span></footer></div>
+  </div>
+
+  <dialog id="employee-dialog"><form id="employee-form"><div class="dialog-header"><h2>Add employee</h2><button type="button" class="close-dialog" aria-label="Close">×</button></div><p class="muted">Create an account, then register their face in person.</p><label>Full name<input name="name" required maxlength="100" autocomplete="name"></label><label>Employee ID<input name="code" required maxlength="40" pattern="[a-zA-Z0-9_-]+" placeholder="CES001"></label><label>Department<select name="department"><option>Production</option><option>Laser</option><option>Service</option><option>Design</option><option>Administration</option><option>Other</option></select></label><label>Initial password<input type="password" name="password" required minlength="12" maxlength="128" autocomplete="new-password"></label><p class="help">Use at least 12 characters. Share this password privately with the employee.</p><button class="primary wide" type="submit">Create employee</button></form></dialog>
+
+  <dialog id="camera-dialog"><div class="dialog-header"><h2 id="camera-title">Verify your attendance</h2><button class="close-dialog" aria-label="Close">×</button></div><p class="muted" id="camera-description">Face the camera and allow location access.</p><div class="camera-frame"><video id="video" autoplay playsinline muted></video><div class="face-guide" aria-hidden="true"></div></div><p id="camera-status" role="status">Starting camera…</p><label id="consent-label" class="consent" hidden><input type="checkbox" id="consent">The employee agrees to face-template, photo and attendance-location storage, and understands how to request removal.</label><p class="help">Face matching is not certified liveness detection and cannot guarantee protection against photo spoofing.</p><button id="capture-button" class="primary wide" disabled>Capture and verify</button></dialog>
+  <div id="notice" role="status" aria-live="polite" hidden></div>
+</body></html>
