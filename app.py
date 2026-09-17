@@ -167,7 +167,7 @@ def http_error(e):
 
 @app.errorhandler(Exception)
 def unexpected(e):
-    app.logger.error('Request failed (%s)', type(e).__name__)
+    app.logger.exception('Request failed')
     return jsonify(error='The request could not be saved. Please try again or contact your administrator.'), 503
 
 
