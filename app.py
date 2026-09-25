@@ -19,11 +19,19 @@ from flask import Flask, Response, abort, jsonify, render_template, request, ses
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from PIL import Image, ImageOps, UnidentifiedImageError
-from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, ForeignKey, create_engine, select, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, ForeignKey, create_engine, select, delete, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
+from webauthn import (
+    base64url_to_bytes, generate_authentication_options, generate_registration_options,
+    options_to_json, verify_authentication_response, verify_registration_response,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorAttachment, AuthenticatorSelectionCriteria, PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement, UserVerificationRequirement,
+)
 
 UTC = timezone.utc
 LOCAL = ZoneInfo(os.getenv('TZ_NAME', 'Asia/Kolkata'))
@@ -87,6 +95,27 @@ class Attendance(Base):
     out_photo: Mapped[str | None] = mapped_column(Text, nullable=True)
     in_distance: Mapped[float] = mapped_column(Float)
     out_distance: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class WebAuthnCredential(Base):
+    __tablename__ = 'webauthn_credentials'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_id: Mapped[int] = mapped_column(ForeignKey('employees.id'), index=True)
+    credential_id: Mapped[str] = mapped_column(Text, unique=True)
+    public_key: Mapped[str] = mapped_column(Text)
+    sign_count: Mapped[int] = mapped_column(Integer, default=0)
+    device_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AuditLog(Base):
+    __tablename__ = 'audit_log'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    admin_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    action: Mapped[str] = mapped_column(String(80))
+    target: Mapped[str] = mapped_column(String(120))
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 app = Flask(__name__)
@@ -167,7 +196,7 @@ def http_error(e):
 
 @app.errorhandler(Exception)
 def unexpected(e):
-    app.logger.exception('Request failed')
+    app.logger.error('Request failed (%s)', type(e).__name__)
     return jsonify(error='The request could not be saved. Please try again or contact your administrator.'), 503
 
 
@@ -197,12 +226,17 @@ def current_session():
 @app.post('/api/login')
 @limiter.limit('5 per minute; 30 per hour')
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
+    code = str(data.get('code', '')).strip().lower()
+    secret = str(data.get('pin', data.get('password', '')))
     with DB() as db:
-        e = db.scalar(select(Employee).where(Employee.code == str(data.get('code', '')).strip().lower()))
-        valid = check_password_hash(e.password if e else DUMMY_PASSWORD, str(data.get('password', '')))
+        e = db.scalar(select(Employee).where(Employee.code == code))
+        if e and not e.admin and not re.fullmatch(r'\d{4}', secret):
+            valid = False
+        else:
+            valid = check_password_hash(e.password if e else DUMMY_PASSWORD, secret)
         if not e or not e.active or not valid:
-            abort(401, 'Employee ID or password is incorrect.')
+            abort(401, 'Employee ID or PIN is incorrect.' if not (e and e.admin) else 'Administrator ID or password is incorrect.')
         session.clear()
         session.update(uid=e.id, csrf=secrets.token_urlsafe(32), auth=hashlib.sha256(e.password.encode()).hexdigest())
         session.permanent = True
@@ -210,6 +244,114 @@ def login():
 
 
 DUMMY_PASSWORD = generate_password_hash(secrets.token_urlsafe(32))
+
+
+def rp_settings():
+    host = request.host.split(':', 1)[0]
+    return host, request.host_url.rstrip('/')
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
+
+
+@app.post('/api/biometric/register/options')
+@login_required()
+def biometric_register_options():
+    rp_id, _ = rp_settings()
+    with DB() as db:
+        existing = [PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id))
+                    for c in db.scalars(select(WebAuthnCredential).where(WebAuthnCredential.employee_id == request.employee.id))]
+    options = generate_registration_options(
+        rp_id=rp_id, rp_name='Cosmos Engineering Solutions',
+        user_id=str(request.employee.id).encode(), user_name=request.employee.code,
+        user_display_name=request.employee.name, exclude_credentials=existing,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+            resident_key=ResidentKeyRequirement.PREFERRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+    )
+    session['webauthn_register_challenge'] = b64(options.challenge)
+    return app.response_class(options_to_json(options), mimetype='application/json')
+
+
+@app.post('/api/biometric/register/verify')
+@login_required()
+def biometric_register_verify():
+    challenge = session.pop('webauthn_register_challenge', None)
+    if not challenge:
+        abort(400, 'Biometric registration expired. Start again.')
+    rp_id, origin = rp_settings()
+    try:
+        result = verify_registration_response(
+            credential=request.get_json(), expected_challenge=base64url_to_bytes(challenge),
+            expected_origin=origin, expected_rp_id=rp_id, require_user_verification=True,
+        )
+    except Exception:
+        abort(400, 'Biometric registration could not be verified.')
+    cid=b64(result.credential_id)
+    with DB.begin() as db:
+        if db.scalar(select(WebAuthnCredential.id).where(WebAuthnCredential.credential_id==cid)):
+            abort(409, 'This biometric credential is already registered.')
+        db.add(WebAuthnCredential(employee_id=request.employee.id, credential_id=cid,
+                                  public_key=b64(result.credential_public_key), sign_count=result.sign_count,
+                                  device_name=str((request.get_json() or {}).get('deviceName',''))[:100] or None,
+                                  created_at=now()))
+    return {'ok': True}
+
+
+@app.post('/api/biometric/login/options')
+def biometric_login_options():
+    data=request.get_json() or {}
+    code=str(data.get('code','')).strip().lower()
+    with DB() as db:
+        e=db.scalar(select(Employee).where(Employee.code==code, Employee.active==True))
+        if not e:
+            abort(401, 'Employee ID is incorrect.')
+        creds=db.scalars(select(WebAuthnCredential).where(WebAuthnCredential.employee_id==e.id)).all()
+        if not creds:
+            abort(404, 'No biometric login is registered for this employee.')
+    rp_id,_=rp_settings()
+    options=generate_authentication_options(
+        rp_id=rp_id,
+        allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id)) for c in creds],
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    session['webauthn_login_challenge']=b64(options.challenge)
+    session['webauthn_login_employee']=e.id
+    return app.response_class(options_to_json(options), mimetype='application/json')
+
+
+@app.post('/api/biometric/login/verify')
+def biometric_login_verify():
+    challenge=session.pop('webauthn_login_challenge',None)
+    employee_id=session.pop('webauthn_login_employee',None)
+    if not challenge or not employee_id:
+        abort(400, 'Biometric login expired. Start again.')
+    data=request.get_json() or {}
+    credential_id=str(data.get('id',''))
+    with DB.begin() as db:
+        e=db.get(Employee, employee_id)
+        cred=db.scalar(select(WebAuthnCredential).where(WebAuthnCredential.employee_id==employee_id,
+                                                        WebAuthnCredential.credential_id==credential_id))
+        if not e or not e.active or not cred:
+            abort(401, 'Biometric credential was not recognised.')
+        rp_id,origin=rp_settings()
+        try:
+            result=verify_authentication_response(
+                credential=data, expected_challenge=base64url_to_bytes(challenge), expected_rp_id=rp_id,
+                expected_origin=origin, credential_public_key=base64url_to_bytes(cred.public_key),
+                credential_current_sign_count=cred.sign_count, require_user_verification=True,
+            )
+        except Exception:
+            abort(401, 'Biometric verification failed.')
+        cred.sign_count=result.new_sign_count
+        auth_hash=hashlib.sha256(e.password.encode()).hexdigest()
+    session.clear()
+    session.update(uid=e.id, csrf=secrets.token_urlsafe(32), auth=auth_hash)
+    session.permanent=True
+    return dict(user=person(e), csrf=session['csrf'])
 
 
 @app.post('/api/logout')
@@ -229,7 +371,12 @@ def clean_text(data, key, limit):
 @login_required(admin=True)
 def employees():
     with DB() as db:
-        return jsonify([person(e) for e in db.scalars(select(Employee).where(Employee.admin == False).order_by(Employee.name))])
+        rows=[]
+        for e in db.scalars(select(Employee).where(Employee.admin == False).order_by(Employee.name)):
+            item=person(e)
+            item['biometric_registered']=bool(db.scalar(select(WebAuthnCredential.id).where(WebAuthnCredential.employee_id==e.id).limit(1)))
+            rows.append(item)
+        return jsonify(rows)
 
 
 @app.post('/api/employees')
@@ -239,17 +386,107 @@ def add_employee():
     code = clean_text(data, 'code', 40).lower()
     if not re.fullmatch(r'[a-z0-9_-]+', code):
         abort(400, 'Employee ID may contain letters, numbers, hyphens and underscores.')
-    password = clean_text(data, 'password', 128)
-    if len(password) < 12:
-        abort(400, 'Use a password of at least 12 characters.')
+    pin = clean_text(data, 'pin', 4)
+    if not re.fullmatch(r'\d{4}', pin):
+        abort(400, 'PIN must be exactly 4 digits.')
     with DB.begin() as db:
         if db.scalar(select(Employee).where(Employee.code == code)):
             abort(409, 'That employee ID already exists.')
         e = Employee(code=code, name=clean_text(data, 'name', 100),
-                     department=clean_text(data, 'department', 40), password=generate_password_hash(password))
+                     department=clean_text(data, 'department', 40), password=generate_password_hash(pin))
         db.add(e)
         db.flush()
         return person(e), 201
+
+
+@app.patch('/api/employees/<int:employee_id>')
+@login_required(admin=True)
+def edit_employee(employee_id):
+    data = request.get_json() or {}
+    with DB.begin() as db:
+        e = db.get(Employee, employee_id)
+        if not e or e.admin:
+            abort(404)
+        code = str(data.get('code', e.code)).strip().lower()
+        if not re.fullmatch(r'[a-z0-9_-]+', code):
+            abort(400, 'Employee ID may contain letters, numbers, hyphens and underscores.')
+        clash = db.scalar(select(Employee).where(Employee.code == code, Employee.id != e.id))
+        if clash:
+            abort(409, 'That employee ID already exists.')
+        e.code = code
+        e.name = str(data.get('name', e.name)).strip()[:100] or e.name
+        e.department = str(data.get('department', e.department)).strip()[:40] or e.department
+        db.add(AuditLog(admin_id=request.employee.id, action='edit_employee', target=e.code,
+                       detail=json.dumps({'name': e.name, 'department': e.department}), created_at=now()))
+        return person(e)
+
+
+@app.post('/api/employees/<int:employee_id>/reset-pin')
+@login_required(admin=True)
+def reset_pin(employee_id):
+    data = request.get_json() or {}
+    pin = str(data.get('pin', ''))
+    if not re.fullmatch(r'\d{4}', pin):
+        abort(400, 'PIN must be exactly 4 digits.')
+    with DB.begin() as db:
+        e = db.get(Employee, employee_id)
+        if not e or e.admin:
+            abort(404)
+        e.password = generate_password_hash(pin)
+        db.add(AuditLog(admin_id=request.employee.id, action='reset_pin', target=e.code, detail=None, created_at=now()))
+    return {'ok': True}
+
+
+@app.post('/api/employees/<int:employee_id>/reset-face')
+@login_required(admin=True)
+def reset_face(employee_id):
+    old=None
+    with DB.begin() as db:
+        e=db.get(Employee,employee_id)
+        if not e or e.admin:
+            abort(404)
+        old=e.photo_id
+        e.photo_id=None
+        e.encoding=None
+        e.consent_at=None
+        db.add(AuditLog(admin_id=request.employee.id, action='reset_face', target=e.code, detail=None, created_at=now()))
+    remove_photo(old)
+    return {'ok':True}
+
+
+@app.post('/api/employees/<int:employee_id>/reset-biometric')
+@login_required(admin=True)
+def reset_biometric(employee_id):
+    with DB.begin() as db:
+        e = db.get(Employee, employee_id)
+        if not e or e.admin:
+            abort(404)
+        db.execute(delete(WebAuthnCredential).where(WebAuthnCredential.employee_id == e.id))
+        db.add(AuditLog(admin_id=request.employee.id, action='reset_biometric', target=e.code, detail=None, created_at=now()))
+    return {'ok': True}
+
+
+@app.delete('/api/employees/<int:employee_id>')
+@login_required(admin=True)
+def delete_employee(employee_id):
+    photos=[]
+    with DB.begin() as db:
+        e = db.get(Employee, employee_id)
+        if not e or e.admin:
+            abort(404)
+        if db.scalar(select(Attendance.id).where(Attendance.employee_id == e.id, Attendance.out_at == None)):
+            abort(409, 'This employee must check out before removal.')
+        rows=db.scalars(select(Attendance).where(Attendance.employee_id == e.id)).all()
+        for r in rows:
+            photos.extend([r.in_photo, r.out_photo])
+        photos.append(e.photo_id)
+        db.execute(delete(WebAuthnCredential).where(WebAuthnCredential.employee_id == e.id))
+        db.execute(delete(Attendance).where(Attendance.employee_id == e.id))
+        db.delete(e)
+        db.add(AuditLog(admin_id=request.employee.id, action='delete_employee', target=e.code, detail=None, created_at=now()))
+    for photo in photos:
+        remove_photo(photo)
+    return {'ok': True}
 
 
 @app.post('/api/employees/<int:employee_id>/active')
@@ -456,6 +693,60 @@ def my_status():
     with DB() as db:
         r = db.scalar(select(Attendance).where(Attendance.employee_id == request.employee.id, Attendance.out_at == None))
         return dict(open_shift=record(r, request.employee) if r else None)
+
+
+@app.patch('/api/attendance/<int:attendance_id>')
+@login_required(admin=True)
+def edit_attendance(attendance_id):
+    data=request.get_json() or {}
+    with DB.begin() as db:
+        r=db.get(Attendance, attendance_id)
+        if not r:
+            abort(404)
+        e=db.get(Employee, r.employee_id)
+        for key, attr in [('check_in','in_at'),('check_out','out_at')]:
+            if key in data:
+                value=data.get(key)
+                if value in (None,'') and key=='check_out':
+                    setattr(r, attr, None)
+                else:
+                    try:
+                        dt=datetime.fromisoformat(str(value))
+                        if dt.tzinfo is None:
+                            dt=dt.replace(tzinfo=LOCAL)
+                        setattr(r, attr, dt.astimezone(UTC))
+                    except ValueError:
+                        abort(400, f'Invalid {key.replace("_"," ")} time.')
+        if r.out_at and aware(r.out_at) < aware(r.in_at):
+            abort(400, 'Check-out cannot be before check-in.')
+        db.add(AuditLog(admin_id=request.employee.id, action='edit_attendance', target=f'{e.code}:{r.work_date}',
+                       detail=json.dumps({'check_in':data.get('check_in'),'check_out':data.get('check_out')}), created_at=now()))
+        return record(r,e)
+
+
+@app.delete('/api/attendance/<int:attendance_id>')
+@login_required(admin=True)
+def delete_attendance(attendance_id):
+    photos=[]
+    with DB.begin() as db:
+        r=db.get(Attendance, attendance_id)
+        if not r:
+            abort(404)
+        e=db.get(Employee,r.employee_id)
+        photos=[r.in_photo,r.out_photo]
+        db.delete(r)
+        db.add(AuditLog(admin_id=request.employee.id, action='delete_attendance', target=f'{e.code}:{r.work_date}', detail=None, created_at=now()))
+    for photo in photos:
+        remove_photo(photo)
+    return {'ok':True}
+
+
+@app.get('/api/audit')
+@login_required(admin=True)
+def audit():
+    with DB() as db:
+        rows=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(250)).all()
+        return jsonify([dict(id=x.id,action=x.action,target=x.target,detail=x.detail,created_at=aware(x.created_at).isoformat()) for x in rows])
 
 
 @app.get('/api/export')
