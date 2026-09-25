@@ -590,69 +590,102 @@ def gps(data):
         abort(400, 'A fresh GPS location is required. Allow location access and try again.')
 
 
-@app.post('/api/attendance')
+@app.post('/api/attendance/biometric/options')
 @login_required()
-@limiter.limit('6 per minute')
-def mark_attendance():
-    data = request.get_json()
+@limiter.limit('10 per minute')
+def attendance_biometric_options():
+    if request.employee.admin:
+        abort(403, 'Administrator accounts do not mark employee attendance.')
+    data = request.get_json() or {}
     action = data.get('action')
     if action not in ('in', 'out'):
         abort(400, 'Choose check-in or check-out.')
-    lat, lng, accuracy = gps(data.get('location', {}))
-    if request.employee.admin or not request.employee.encoding:
-        abort(403, 'Ask your administrator to enrol your face first.')
-    # Validate again under the employee row lock before committing attendance.
-    if not request.employee.capture_token or data.get('challenge') != request.employee.capture_token or (now() - aware(request.employee.capture_at)).total_seconds() > 120:
-        abort(400, 'Camera session expired. Start the camera again.')
-    encoding, raw = face_image(data.get('photo'))
-    stored = np.array(json.loads(CIPHER.decrypt(request.employee.encoding.encode())))
-    distance = float(np.linalg.norm(stored - encoding))
-    if not math.isfinite(distance) or distance > THRESHOLD:
-        abort(403, 'Face did not match your registered photo. Try better lighting or contact your administrator.')
-    photo = None
-    try:
-        with DB.begin() as db:
-            e = db.scalar(select(Employee).where(Employee.id == request.employee.id).with_for_update())
-            if not e.active or e.encoding != request.employee.encoding:
-                abort(409, 'Your employee profile changed. Sign in again.')
-            if not e.capture_token or not secrets.compare_digest(str(data.get('challenge', '')), e.capture_token) or (now() - aware(e.capture_at)).total_seconds() > 120:
-                abort(409, 'This camera session expired or was already used. Try again.')
-            open_record = db.scalar(select(Attendance).where(Attendance.employee_id == e.id, Attendance.out_at == None))
-            stamp = now()
-            day = stamp.astimezone(LOCAL).date().isoformat()
-            if action == 'in':
-                if open_record:
-                    abort(409, 'You are already checked in. Check out first.')
-                if db.scalar(select(Attendance.id).where(Attendance.employee_id == e.id, Attendance.work_date == day)):
-                    abort(409, 'Attendance is complete for today. One shift per day is supported.')
-            elif not open_record:
-                abort(409, 'You do not have an open check-in.')
-            photo = upload_photo(raw)
-            e.capture_token, e.capture_at = None, None
-            if action == 'in':
-                r = Attendance(employee_id=e.id, work_date=day, in_at=stamp, in_lat=lat, in_lng=lng,
-                               in_accuracy=accuracy, in_photo=photo, in_distance=distance)
-                db.add(r)
-            else:
-                r = open_record
-                r.out_at, r.out_lat, r.out_lng, r.out_accuracy = stamp, lat, lng, accuracy
-                r.out_photo, r.out_distance = photo, distance
-            db.flush()
-            result = record(r, e)
-    except Exception:
-        remove_photo(photo)
-        raise
-    return result, 201
+    with DB() as db:
+        creds = db.scalars(select(WebAuthnCredential).where(
+            WebAuthnCredential.employee_id == request.employee.id
+        )).all()
+        if not creds:
+            abort(404, 'Set up phone biometric / passkey before marking attendance.')
+    rp_id, _ = rp_settings()
+    options = generate_authentication_options(
+        rp_id=rp_id,
+        allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id)) for c in creds],
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    session['attendance_webauthn_challenge'] = b64(options.challenge)
+    session['attendance_webauthn_action'] = action
+    return app.response_class(options_to_json(options), mimetype='application/json')
 
 
-@app.post('/api/capture')
+@app.post('/api/attendance/biometric/verify')
 @login_required()
-def capture_challenge():
-    token = secrets.token_urlsafe(32)
+@limiter.limit('10 per minute')
+def attendance_biometric_verify():
+    if request.employee.admin:
+        abort(403, 'Administrator accounts do not mark employee attendance.')
+    challenge = session.pop('attendance_webauthn_challenge', None)
+    expected_action = session.pop('attendance_webauthn_action', None)
+    data = request.get_json() or {}
+    action = data.get('action')
+    if not challenge or expected_action not in ('in', 'out') or action != expected_action:
+        abort(400, 'Biometric attendance request expired. Try again.')
+    lat, lng, accuracy = gps(data.get('location', {}))
+    credential = data.get('credential') or {}
+    credential_id = str(credential.get('id', ''))
     with DB.begin() as db:
         e = db.scalar(select(Employee).where(Employee.id == request.employee.id).with_for_update())
-        e.capture_token, e.capture_at = token, now()
-    return {'challenge': token}
+        if not e or not e.active:
+            abort(401, 'Employee account is not active.')
+        cred = db.scalar(select(WebAuthnCredential).where(
+            WebAuthnCredential.employee_id == e.id,
+            WebAuthnCredential.credential_id == credential_id
+        ))
+        if not cred:
+            abort(401, 'Biometric credential was not recognised.')
+        rp_id, origin = rp_settings()
+        try:
+            result = verify_authentication_response(
+                credential=credential,
+                expected_challenge=base64url_to_bytes(challenge),
+                expected_rp_id=rp_id,
+                expected_origin=origin,
+                credential_public_key=base64url_to_bytes(cred.public_key),
+                credential_current_sign_count=cred.sign_count,
+                require_user_verification=True,
+            )
+        except Exception:
+            abort(401, 'Biometric verification failed.')
+        cred.sign_count = result.new_sign_count
+
+        open_record = db.scalar(select(Attendance).where(
+            Attendance.employee_id == e.id,
+            Attendance.out_at == None
+        ))
+        stamp = now()
+        day = stamp.astimezone(LOCAL).date().isoformat()
+        if action == 'in':
+            if open_record:
+                abort(409, 'You are already checked in. Check out first.')
+            if db.scalar(select(Attendance.id).where(
+                Attendance.employee_id == e.id,
+                Attendance.work_date == day
+            )):
+                abort(409, 'Attendance is complete for today. One shift per day is supported.')
+            r = Attendance(
+                employee_id=e.id, work_date=day, in_at=stamp,
+                in_lat=lat, in_lng=lng, in_accuracy=accuracy,
+                in_photo=None, in_distance=None
+            )
+            db.add(r)
+        else:
+            if not open_record:
+                abort(409, 'You do not have an open check-in.')
+            r = open_record
+            r.out_at, r.out_lat, r.out_lng, r.out_accuracy = stamp, lat, lng, accuracy
+            r.out_photo, r.out_distance = None, None
+        db.flush()
+        result_record = record(r, e)
+    return result_record, 201
 
 
 def filtered_records(db):
@@ -692,7 +725,13 @@ def get_attendance():
 def my_status():
     with DB() as db:
         r = db.scalar(select(Attendance).where(Attendance.employee_id == request.employee.id, Attendance.out_at == None))
-        return dict(open_shift=record(r, request.employee) if r else None)
+        biometric_registered = bool(db.scalar(select(WebAuthnCredential.id).where(
+            WebAuthnCredential.employee_id == request.employee.id
+        ).limit(1)))
+        return dict(
+            open_shift=record(r, request.employee) if r else None,
+            biometric_registered=biometric_registered,
+        )
 
 
 @app.patch('/api/attendance/<int:attendance_id>')
