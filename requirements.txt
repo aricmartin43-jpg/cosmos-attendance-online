@@ -10,3 +10,5 @@ cloudinary==1.44.1
 cryptography==45.0.7
 Flask-Limiter==3.12
 setuptools==80.9.0
+
+webauthn==3.0.0
