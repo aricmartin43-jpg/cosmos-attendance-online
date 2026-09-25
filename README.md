@@ -146,3 +146,38 @@ These are not enabled in the current basic version.
 - Render Docker: https://render.com/docs/docker
 - Neon Python connections: https://neon.com/docs/guides/python
 - Cloudinary authenticated media: https://cloudinary.com/documentation/upload_parameters
+
+## V2 authentication and admin upgrade (25 Sep 2026)
+
+This copy adds the requested login and administrator controls while preserving the existing face + GPS attendance flow.
+
+### Login
+- Employees can sign in with Employee ID + exactly 4-digit PIN.
+- After a PIN sign-in, an employee can register a device biometric/passkey using WebAuthn.
+- Later, the employee enters their Employee ID and chooses **Use phone biometric / passkey**.
+- WebAuthn supports platform authenticators such as Face ID, Touch ID, Android biometrics and Windows Hello when the browser/device exposes them.
+- Raw fingerprints/Face ID are never sent to Cosmos; the server stores a WebAuthn public-key credential.
+- The administrator account continues to use a strong password rather than a 4-digit PIN.
+
+### Administrator controls
+- Add employee with 4-digit PIN.
+- Edit employee name, ID and department.
+- Reset employee PIN.
+- Register/re-register/remove attendance face.
+- Reset all biometric/passkey credentials for an employee.
+- Activate/deactivate employee.
+- Permanently remove employee and that employee's attendance/credential records.
+- Edit check-in/check-out timestamps.
+- Delete attendance records.
+- Server audit-log table records sensitive admin changes.
+
+### Existing database upgrade
+`init_db.py` calls SQLAlchemy `create_all()`, so deploying this version against the existing Neon database creates the new `webauthn_credentials` and `audit_log` tables without deleting the current employee or attendance tables.
+
+**Important:** existing non-admin employee passwords are not automatically converted to 4-digit PINs. After deployment, sign in as administrator and use **Reset PIN** for each existing employee before they use the new employee login.
+
+### Dependency
+This version adds `webauthn==3.0.0` to `requirements.txt`.
+
+### Deployment note
+WebAuthn requires a secure context. Use the Render HTTPS URL. The credential is tied to the site's RP/domain, so changing to a different production hostname can require employees to register their biometric/passkey again.
