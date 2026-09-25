@@ -55,9 +55,9 @@ async function refreshMine() {
   openShift = status.open_shift;
   $('greeting').textContent = 'Hello, ' + user.name.split(' ')[0] + '.';
   const finished = rows.some(r => r.check_out);
-  $('employee-status').textContent = !user.enrolled ? 'Your administrator needs to register your face first.' : openShift ? 'Checked in at ' + time(openShift.check_in) + ' · ' + openShift.date : finished ? 'Your attendance is complete for today.' : 'Ready for a new working day.';
-  $('start-attendance').textContent = openShift ? 'Check out with face verification' : 'Check in with face verification';
-  $('start-attendance').disabled = !user.enrolled || (!openShift && finished);
+  $('employee-status').textContent = !status.biometric_registered ? 'Set up phone biometric / passkey before marking attendance.' : openShift ? 'Checked in at ' + time(openShift.check_in) + ' · ' + openShift.date : finished ? 'Your attendance is complete for today.' : 'Ready for a new working day.';
+  $('start-attendance').textContent = openShift ? 'Check out with biometric' : 'Check in with biometric';
+  $('start-attendance').disabled = !status.biometric_registered || (!openShift && finished);
   attendanceTable('my-table', rows);
 }
 const views = {overview:['Attendance overview',"A clear view of your team's working day.",'▦'],employees:['Employees','The people behind every working day.','⊞'],reports:['Monthly reports','Attendance records, ready for your monthly review.','▤'],checkin:['My attendance','Check in, get to work, and make today count.','◎']};
@@ -142,7 +142,19 @@ async function startCamera(mode){
     $('camera-status').textContent='Camera ready. Keep your face inside the guide.';$('capture-button').textContent=mode.employee?'Capture and register':'Capture and verify';$('capture-button').disabled=false;
   }catch(e){$('camera-status').textContent=e.name==='NotAllowedError'?'Camera permission denied. Allow camera access in your browser settings.':e.message;stopCamera();}
 }
-$('start-attendance').addEventListener('click',()=>perform(async()=>{await refreshMine();if(!$('start-attendance').disabled)await startCamera({action:openShift?'out':'in'});}));
+$('start-attendance').addEventListener('click',()=>perform(async()=>{
+  await refreshMine();
+  if($('start-attendance').disabled)return;
+  if(!window.PublicKeyCredential)throw new Error('Biometric/passkey attendance is not supported by this browser.');
+  const action=openShift?'out':'in';
+  const location=await getLocation();
+  const options=decodeRequestOptions(await api('/api/attendance/biometric/options','POST',{action}));
+  const credential=await navigator.credentials.get({publicKey:options});
+  if(!credential)throw new Error('Biometric verification was cancelled.');
+  await api('/api/attendance/biometric/verify','POST',{action,location,credential:credentialJSON(credential)});
+  await refreshMine();
+  notice(action==='in'?'Checked in successfully. Have a good day.':'Checked out successfully.');
+}));
 function getLocation(){return new Promise((resolve,reject)=>{
   if(!navigator.geolocation)return reject(new Error('Location is not supported by this browser.'));
   navigator.geolocation.getCurrentPosition(p=>resolve({lat:p.coords.latitude,lng:p.coords.longitude,accuracy:p.coords.accuracy,timestamp:p.timestamp}),()=>reject(new Error('Unable to get location. Allow location access, enable GPS, and try again.')),{enableHighAccuracy:true,timeout:20000,maximumAge:0});
