@@ -24,15 +24,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from werkzeug.exceptions import HTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
-from webauthn import (
-    base64url_to_bytes, generate_authentication_options, generate_registration_options,
-    options_to_json, verify_authentication_response, verify_registration_response,
-)
-from webauthn.helpers.structs import (
-    AuthenticatorAttachment, AuthenticatorSelectionCriteria, PublicKeyCredentialDescriptor,
-    ResidentKeyRequirement, UserVerificationRequirement,
-)
-
 UTC = timezone.utc
 LOCAL = ZoneInfo(os.getenv('TZ_NAME', 'Asia/Kolkata'))
 PRODUCTION = os.getenv('APP_ENV', 'production') == 'production'
@@ -255,105 +246,6 @@ def b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b'=').decode()
 
 
-@app.post('/api/biometric/register/options')
-@login_required()
-def biometric_register_options():
-    rp_id, _ = rp_settings()
-    with DB() as db:
-        existing = [PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id))
-                    for c in db.scalars(select(WebAuthnCredential).where(WebAuthnCredential.employee_id == request.employee.id))]
-    options = generate_registration_options(
-        rp_id=rp_id, rp_name='Cosmos Engineering Solutions',
-        user_id=str(request.employee.id).encode(), user_name=request.employee.code,
-        user_display_name=request.employee.name, exclude_credentials=existing,
-        authenticator_selection=AuthenticatorSelectionCriteria(
-            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
-            resident_key=ResidentKeyRequirement.PREFERRED,
-            user_verification=UserVerificationRequirement.REQUIRED,
-        ),
-    )
-    session['webauthn_register_challenge'] = b64(options.challenge)
-    return app.response_class(options_to_json(options), mimetype='application/json')
-
-
-@app.post('/api/biometric/register/verify')
-@login_required()
-def biometric_register_verify():
-    challenge = session.pop('webauthn_register_challenge', None)
-    if not challenge:
-        abort(400, 'Biometric registration expired. Start again.')
-    rp_id, origin = rp_settings()
-    try:
-        result = verify_registration_response(
-            credential=request.get_json(), expected_challenge=base64url_to_bytes(challenge),
-            expected_origin=origin, expected_rp_id=rp_id, require_user_verification=True,
-        )
-    except Exception:
-        abort(400, 'Biometric registration could not be verified.')
-    cid=b64(result.credential_id)
-    with DB.begin() as db:
-        if db.scalar(select(WebAuthnCredential.id).where(WebAuthnCredential.credential_id==cid)):
-            abort(409, 'This biometric credential is already registered.')
-        db.add(WebAuthnCredential(employee_id=request.employee.id, credential_id=cid,
-                                  public_key=b64(result.credential_public_key), sign_count=result.sign_count,
-                                  device_name=str((request.get_json() or {}).get('deviceName',''))[:100] or None,
-                                  created_at=now()))
-    return {'ok': True}
-
-
-@app.post('/api/biometric/login/options')
-def biometric_login_options():
-    data=request.get_json() or {}
-    code=str(data.get('code','')).strip().lower()
-    with DB() as db:
-        e=db.scalar(select(Employee).where(Employee.code==code, Employee.active==True))
-        if not e:
-            abort(401, 'Employee ID is incorrect.')
-        creds=db.scalars(select(WebAuthnCredential).where(WebAuthnCredential.employee_id==e.id)).all()
-        if not creds:
-            abort(404, 'No biometric login is registered for this employee.')
-    rp_id,_=rp_settings()
-    options=generate_authentication_options(
-        rp_id=rp_id,
-        allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id)) for c in creds],
-        user_verification=UserVerificationRequirement.REQUIRED,
-    )
-    session['webauthn_login_challenge']=b64(options.challenge)
-    session['webauthn_login_employee']=e.id
-    return app.response_class(options_to_json(options), mimetype='application/json')
-
-
-@app.post('/api/biometric/login/verify')
-def biometric_login_verify():
-    challenge=session.pop('webauthn_login_challenge',None)
-    employee_id=session.pop('webauthn_login_employee',None)
-    if not challenge or not employee_id:
-        abort(400, 'Biometric login expired. Start again.')
-    data=request.get_json() or {}
-    credential_id=str(data.get('id',''))
-    with DB.begin() as db:
-        e=db.get(Employee, employee_id)
-        cred=db.scalar(select(WebAuthnCredential).where(WebAuthnCredential.employee_id==employee_id,
-                                                        WebAuthnCredential.credential_id==credential_id))
-        if not e or not e.active or not cred:
-            abort(401, 'Biometric credential was not recognised.')
-        rp_id,origin=rp_settings()
-        try:
-            result=verify_authentication_response(
-                credential=data, expected_challenge=base64url_to_bytes(challenge), expected_rp_id=rp_id,
-                expected_origin=origin, credential_public_key=base64url_to_bytes(cred.public_key),
-                credential_current_sign_count=cred.sign_count, require_user_verification=True,
-            )
-        except Exception:
-            abort(401, 'Biometric verification failed.')
-        cred.sign_count=result.new_sign_count
-        auth_hash=hashlib.sha256(e.password.encode()).hexdigest()
-    session.clear()
-    session.update(uid=e.id, csrf=secrets.token_urlsafe(32), auth=auth_hash)
-    session.permanent=True
-    return dict(user=person(e), csrf=session['csrf'])
-
-
 @app.post('/api/logout')
 def logout():
     session.clear()
@@ -373,9 +265,7 @@ def employees():
     with DB() as db:
         rows=[]
         for e in db.scalars(select(Employee).where(Employee.admin == False).order_by(Employee.name)):
-            item=person(e)
-            item['biometric_registered']=bool(db.scalar(select(WebAuthnCredential.id).where(WebAuthnCredential.employee_id==e.id).limit(1)))
-            rows.append(item)
+            rows.append(person(e))
         return jsonify(rows)
 
 
@@ -452,18 +342,6 @@ def reset_face(employee_id):
         db.add(AuditLog(admin_id=request.employee.id, action='reset_face', target=e.code, detail=None, created_at=now()))
     remove_photo(old)
     return {'ok':True}
-
-
-@app.post('/api/employees/<int:employee_id>/reset-biometric')
-@login_required(admin=True)
-def reset_biometric(employee_id):
-    with DB.begin() as db:
-        e = db.get(Employee, employee_id)
-        if not e or e.admin:
-            abort(404)
-        db.execute(delete(WebAuthnCredential).where(WebAuthnCredential.employee_id == e.id))
-        db.add(AuditLog(admin_id=request.employee.id, action='reset_biometric', target=e.code, detail=None, created_at=now()))
-    return {'ok': True}
 
 
 @app.delete('/api/employees/<int:employee_id>')
@@ -622,7 +500,7 @@ def mark_attendance():
             r = Attendance(
                 employee_id=e.id, work_date=day, in_at=stamp,
                 in_lat=lat, in_lng=lng, in_accuracy=accuracy,
-                in_photo=None, in_distance=None
+                in_photo='', in_distance=0.0
             )
             db.add(r)
         else:
