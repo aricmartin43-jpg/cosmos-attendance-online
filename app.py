@@ -590,73 +590,21 @@ def gps(data):
         abort(400, 'A fresh GPS location is required. Allow location access and try again.')
 
 
-@app.post('/api/attendance/biometric/options')
+@app.post('/api/attendance')
 @login_required()
 @limiter.limit('10 per minute')
-def attendance_biometric_options():
+def mark_attendance():
     if request.employee.admin:
         abort(403, 'Administrator accounts do not mark employee attendance.')
     data = request.get_json() or {}
     action = data.get('action')
     if action not in ('in', 'out'):
         abort(400, 'Choose check-in or check-out.')
-    with DB() as db:
-        creds = db.scalars(select(WebAuthnCredential).where(
-            WebAuthnCredential.employee_id == request.employee.id
-        )).all()
-        if not creds:
-            abort(404, 'Set up phone biometric / passkey before marking attendance.')
-    rp_id, _ = rp_settings()
-    options = generate_authentication_options(
-        rp_id=rp_id,
-        allow_credentials=[PublicKeyCredentialDescriptor(id=base64url_to_bytes(c.credential_id)) for c in creds],
-        user_verification=UserVerificationRequirement.REQUIRED,
-    )
-    session['attendance_webauthn_challenge'] = b64(options.challenge)
-    session['attendance_webauthn_action'] = action
-    return app.response_class(options_to_json(options), mimetype='application/json')
-
-
-@app.post('/api/attendance/biometric/verify')
-@login_required()
-@limiter.limit('10 per minute')
-def attendance_biometric_verify():
-    if request.employee.admin:
-        abort(403, 'Administrator accounts do not mark employee attendance.')
-    challenge = session.pop('attendance_webauthn_challenge', None)
-    expected_action = session.pop('attendance_webauthn_action', None)
-    data = request.get_json() or {}
-    action = data.get('action')
-    if not challenge or expected_action not in ('in', 'out') or action != expected_action:
-        abort(400, 'Biometric attendance request expired. Try again.')
     lat, lng, accuracy = gps(data.get('location', {}))
-    credential = data.get('credential') or {}
-    credential_id = str(credential.get('id', ''))
     with DB.begin() as db:
         e = db.scalar(select(Employee).where(Employee.id == request.employee.id).with_for_update())
         if not e or not e.active:
             abort(401, 'Employee account is not active.')
-        cred = db.scalar(select(WebAuthnCredential).where(
-            WebAuthnCredential.employee_id == e.id,
-            WebAuthnCredential.credential_id == credential_id
-        ))
-        if not cred:
-            abort(401, 'Biometric credential was not recognised.')
-        rp_id, origin = rp_settings()
-        try:
-            result = verify_authentication_response(
-                credential=credential,
-                expected_challenge=base64url_to_bytes(challenge),
-                expected_rp_id=rp_id,
-                expected_origin=origin,
-                credential_public_key=base64url_to_bytes(cred.public_key),
-                credential_current_sign_count=cred.sign_count,
-                require_user_verification=True,
-            )
-        except Exception:
-            abort(401, 'Biometric verification failed.')
-        cred.sign_count = result.new_sign_count
-
         open_record = db.scalar(select(Attendance).where(
             Attendance.employee_id == e.id,
             Attendance.out_at == None
@@ -686,7 +634,6 @@ def attendance_biometric_verify():
         db.flush()
         result_record = record(r, e)
     return result_record, 201
-
 
 def filtered_records(db):
     query = select(Attendance, Employee).join(Employee, Employee.id == Attendance.employee_id)
@@ -725,13 +672,7 @@ def get_attendance():
 def my_status():
     with DB() as db:
         r = db.scalar(select(Attendance).where(Attendance.employee_id == request.employee.id, Attendance.out_at == None))
-        biometric_registered = bool(db.scalar(select(WebAuthnCredential.id).where(
-            WebAuthnCredential.employee_id == request.employee.id
-        ).limit(1)))
-        return dict(
-            open_shift=record(r, request.employee) if r else None,
-            biometric_registered=biometric_registered,
-        )
+        return dict(open_shift=record(r, request.employee) if r else None)
 
 
 @app.patch('/api/attendance/<int:attendance_id>')
