@@ -44,8 +44,8 @@ async function refreshOverview() {
 }
 async function refreshEmployees() {
   team = await api('/api/employees');
-  if (!team.length) { $('employee-table').innerHTML = '<div class="empty"><strong>Build your Cosmos team</strong>Add your first employee, then register their face.</div>'; return; }
-  $('employee-table').innerHTML = `<div class="table-wrap"><table><thead><tr><th>Employee</th><th>Department</th><th>Face</th><th>Biometric</th><th>Access</th><th>Actions</th></tr></thead><tbody>${team.map(e => `<tr><td>${personCell(e.name,e.code)}</td><td>${escapeHTML(e.department)}</td><td><span class="pill ${e.enrolled ? '' : 'warning'}">${e.enrolled ? 'Registered' : 'Not registered'}</span></td><td><span class="pill ${e.biometric_registered ? '' : 'warning'}">${e.biometric_registered ? 'Registered' : 'Not registered'}</span></td><td>${e.active ? 'Active' : 'Inactive'}</td><td><div class="action-buttons"><button class="small-button" data-edit="${e.id}">Edit</button>${e.active ? `<button class="small-button" data-enrol="${e.id}">${e.enrolled ? 'Re-register face' : 'Register face'}</button>` : ''}${e.enrolled ? `<button class="small-button" data-resetface="${e.id}">Remove face</button>` : ''}<button class="small-button" data-pin="${e.id}">Reset PIN</button>${e.biometric_registered ? `<button class="small-button" data-resetbio="${e.id}">Reset biometric</button>` : ''}<button class="small-button" data-toggle="${e.id}">${e.active ? 'Deactivate' : 'Activate'}</button><button class="small-button danger" data-delete="${e.id}">Remove</button></div></td></tr>`).join('')}</tbody></table></div>`;
+  if (!team.length) { $('employee-table').innerHTML = '<div class="empty"><strong>Build your Cosmos team</strong>Add your first employee to get started.</div>'; return; }
+  $('employee-table').innerHTML = `<div class="table-wrap"><table><thead><tr><th>Employee</th><th>Department</th><th>Access</th><th>Actions</th></tr></thead><tbody>${team.map(e => `<tr><td>${personCell(e.name,e.code)}</td><td>${escapeHTML(e.department)}</td><td>${e.active ? 'Active' : 'Inactive'}</td><td><div class="action-buttons"><button class="small-button" data-edit="${e.id}">Edit</button><button class="small-button" data-pin="${e.id}">Reset PIN</button><button class="small-button" data-toggle="${e.id}">${e.active ? 'Deactivate' : 'Activate'}</button><button class="small-button danger" data-delete="${e.id}">Remove</button></div></td></tr>`).join('')}</tbody></table></div>`;
 }
 async function refreshMine() {
   const identity = await api('/api/session');
@@ -55,9 +55,9 @@ async function refreshMine() {
   openShift = status.open_shift;
   $('greeting').textContent = 'Hello, ' + user.name.split(' ')[0] + '.';
   const finished = rows.some(r => r.check_out);
-  $('employee-status').textContent = !status.biometric_registered ? 'Set up phone biometric / passkey before marking attendance.' : openShift ? 'Checked in at ' + time(openShift.check_in) + ' · ' + openShift.date : finished ? 'Your attendance is complete for today.' : 'Ready for a new working day.';
-  $('start-attendance').textContent = openShift ? 'Check out with biometric' : 'Check in with biometric';
-  $('start-attendance').disabled = !status.biometric_registered || (!openShift && finished);
+  $('employee-status').textContent = openShift ? 'Checked in at ' + time(openShift.check_in) + ' · ' + openShift.date : finished ? 'Your attendance is complete for today.' : 'Ready for a new working day.';
+  $('start-attendance').textContent = openShift ? 'Check out' : 'Check in';
+  $('start-attendance').disabled = !openShift && finished;
   attendanceTable('my-table', rows);
 }
 const views = {overview:['Attendance overview',"A clear view of your team's working day.",'▦'],employees:['Employees','The people behind every working day.','⊞'],reports:['Monthly reports','Attendance records, ready for your monthly review.','▤'],checkin:['My attendance','Check in, get to work, and make today count.','◎']};
@@ -85,15 +85,6 @@ async function boot() {
   const info = await api('/api/session'); csrf=info.csrf; user=info.user; today=info.today; zone=info.timezone;
   if(user) await showApp(); else {$('app-view').hidden=true; $('login-view').hidden=false;}
 }
-function b64urlToBytes(value){const pad='='.repeat((4-value.length%4)%4),b64=(value+pad).replace(/-/g,'+').replace(/_/g,'/'),raw=atob(b64);return Uint8Array.from(raw,c=>c.charCodeAt(0));}
-function bytesToB64url(value){const bytes=new Uint8Array(value);let raw='';bytes.forEach(b=>raw+=String.fromCharCode(b));return btoa(raw).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');}
-function decodeCreationOptions(o){o.challenge=b64urlToBytes(o.challenge);o.user.id=b64urlToBytes(o.user.id);(o.excludeCredentials||[]).forEach(c=>c.id=b64urlToBytes(c.id));return o;}
-function decodeRequestOptions(o){o.challenge=b64urlToBytes(o.challenge);(o.allowCredentials||[]).forEach(c=>c.id=b64urlToBytes(c.id));return o;}
-function credentialJSON(c){return {id:c.id,rawId:bytesToB64url(c.rawId),type:c.type,authenticatorAttachment:c.authenticatorAttachment||undefined,clientExtensionResults:c.getClientExtensionResults(),response:{clientDataJSON:bytesToB64url(c.response.clientDataJSON),authenticatorData:c.response.authenticatorData?bytesToB64url(c.response.authenticatorData):undefined,signature:c.response.signature?bytesToB64url(c.response.signature):undefined,userHandle:c.response.userHandle?bytesToB64url(c.response.userHandle):null,attestationObject:c.response.attestationObject?bytesToB64url(c.response.attestationObject):undefined,transports:c.response.getTransports?c.response.getTransports():undefined}};}
-async function registerBiometric(){if(!window.PublicKeyCredential)throw new Error('Biometric/passkey login is not supported by this browser.');const options=decodeCreationOptions(await api('/api/biometric/register/options','POST',{}));const credential=await navigator.credentials.create({publicKey:options});if(!credential)throw new Error('Biometric registration was cancelled.');await api('/api/biometric/register/verify','POST',credentialJSON(credential));notice('Biometric login registered on this device.');}
-async function loginBiometric(){const code=$('login-code').value.trim();if(!code)throw new Error('Enter your Employee ID first.');if(!window.PublicKeyCredential)throw new Error('Biometric/passkey login is not supported by this browser.');const options=decodeRequestOptions(await api('/api/biometric/login/options','POST',{code}));const credential=await navigator.credentials.get({publicKey:options});if(!credential)throw new Error('Biometric login was cancelled.');const data=await api('/api/biometric/login/verify','POST',credentialJSON(credential));csrf=data.csrf;user=data.user;await showApp();}
-$('biometric-login').addEventListener('click',()=>perform(loginBiometric));
-$('register-biometric').addEventListener('click',()=>perform(registerBiometric));
 $('login-form').addEventListener('submit',e=>{e.preventDefault();perform(async()=>{
   const button=e.currentTarget.querySelector('button');button.disabled=true;
   try {const data=await api('/api/login','POST',Object.fromEntries(new FormData($('login-form'))));csrf=data.csrf;user=data.user;$('login-form').reset();await showApp();}finally{button.disabled=false;}
@@ -111,15 +102,12 @@ $('export').addEventListener('click',()=>perform(async()=>{
 $('add-employee').addEventListener('click',()=>{const f=$('employee-form');f.reset();$('employee-id').value='';$('employee-dialog-title').textContent='Add employee';$('employee-dialog-note').textContent='Create an employee with a private 4-digit PIN.';$('pin-label').hidden=false;$('pin-help').hidden=false;$('employee-save').textContent='Create employee';f.elements.pin.required=true;$('employee-dialog').showModal();});
 $('employee-form').addEventListener('submit',e=>{e.preventDefault();perform(async()=>{
   const button=e.currentTarget.querySelector('button[type=submit]');button.disabled=true;
-  try{const data=Object.fromEntries(new FormData($('employee-form'))),id=data.employee_id;delete data.employee_id;if(id){delete data.pin;await api('/api/employees/'+id,'PATCH',data);notice('Employee details updated.');}else{await api('/api/employees','POST',data);notice('Employee created. Register their face next.');}$('employee-dialog').close();await refreshEmployees();}finally{button.disabled=false;}
+  try{const data=Object.fromEntries(new FormData($('employee-form'))),id=data.employee_id;delete data.employee_id;if(id){delete data.pin;await api('/api/employees/'+id,'PATCH',data);notice('Employee details updated.');}else{await api('/api/employees','POST',data);notice('Employee created successfully.');}$('employee-dialog').close();await refreshEmployees();}finally{button.disabled=false;}
 });});
 $('employee-table').addEventListener('click',e=>perform(async()=>{
-  const button=e.target.closest('button');if(!button)return;const id=Number(button.dataset.enrol||button.dataset.toggle||button.dataset.edit||button.dataset.pin||button.dataset.resetbio||button.dataset.resetface||button.dataset.delete),employee=team.find(p=>p.id===id);if(!employee)return;
-  if(button.dataset.enrol){await startCamera({employee});return;}
+  const button=e.target.closest('button');if(!button)return;const id=Number(button.dataset.toggle||button.dataset.edit||button.dataset.pin||button.dataset.delete),employee=team.find(p=>p.id===id);if(!employee)return;
   if(button.dataset.edit){const f=$('employee-form');f.reset();$('employee-id').value=employee.id;f.elements.name.value=employee.name;f.elements.code.value=employee.code.toUpperCase();f.elements.department.value=employee.department;$('employee-dialog-title').textContent='Edit employee';$('employee-dialog-note').textContent='Change employee identity or department.';$('pin-label').hidden=true;$('pin-help').hidden=true;f.elements.pin.required=false;$('employee-save').textContent='Save changes';$('employee-dialog').showModal();return;}
   if(button.dataset.pin){const pin=prompt(`Enter a new 4-digit PIN for ${employee.name}:`);if(pin===null)return;if(!/^\d{4}$/.test(pin))throw new Error('PIN must be exactly 4 digits.');await api('/api/employees/'+employee.id+'/reset-pin','POST',{pin});notice('Employee PIN reset.');return;}
-  if(button.dataset.resetface){if(!confirm(`Remove the registered attendance face for ${employee.name}?`))return;await api('/api/employees/'+employee.id+'/reset-face','POST',{});await refreshEmployees();notice('Attendance face removed.');return;}
-  if(button.dataset.resetbio){if(!confirm(`Remove all biometric/passkey logins for ${employee.name}? They can register again after signing in with their PIN.`))return;await api('/api/employees/'+employee.id+'/reset-biometric','POST',{});await refreshEmployees();notice('Biometric login reset.');return;}
   if(button.dataset.toggle){if(!confirm(`${employee.active?'Deactivate':'Activate'} ${employee.name}'s account?`))return;await api('/api/employees/'+employee.id+'/active','POST',{active:!employee.active});await refreshEmployees();notice('Employee access updated.');return;}
   if(button.dataset.delete){if(!confirm(`Permanently remove ${employee.name}, including their attendance history and saved biometric credentials?`))return;await api('/api/employees/'+employee.id,'DELETE',{});await refreshEmployees();notice('Employee removed.');}
 }));
@@ -145,10 +133,12 @@ async function startCamera(mode){
 $('start-attendance').addEventListener('click',()=>perform(async()=>{
   await refreshMine();
   if($('start-attendance').disabled)return;
-  if(!window.PublicKeyCredential)throw new Error('Biometric/passkey attendance is not supported by this browser.');
   const action=openShift?'out':'in';
   const location=await getLocation();
-  const options=decodeRequestOptions(await api('/api/attendance/biometric/options','POST',{action}));
+  await api('/api/attendance','POST',{action,location});
+  await refreshMine();
+  notice(action==='in'?'Checked in successfully. Have a good day.':'Checked out successfully.');
+}));
   const credential=await navigator.credentials.get({publicKey:options});
   if(!credential)throw new Error('Biometric verification was cancelled.');
   await api('/api/attendance/biometric/verify','POST',{action,location,credential:credentialJSON(credential)});
