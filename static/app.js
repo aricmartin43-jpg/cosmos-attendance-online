@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 let csrf = '', user = null, team = [], today = '', zone = 'Asia/Kolkata', currentView = '', openShift = null;
-let stream = null, cameraMode = null, challenge = '', toastTimer, cameraRun = 0;
+let toastTimer;
 const escapeHTML = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function notice(message, error = false) {
   $('notice').textContent = message; $('notice').classList.toggle('error', error); $('notice').hidden = false;
@@ -89,7 +89,7 @@ $('login-form').addEventListener('submit',e=>{e.preventDefault();perform(async()
   const button=e.currentTarget.querySelector('button');button.disabled=true;
   try {const data=await api('/api/login','POST',Object.fromEntries(new FormData($('login-form'))));csrf=data.csrf;user=data.user;$('login-form').reset();await showApp();}finally{button.disabled=false;}
 });});
-$('logout').addEventListener('click',()=>perform(async()=>{await api('/api/logout','POST',{});stopCamera();await boot();}));
+$('logout').addEventListener('click',()=>perform(async()=>{await api('/api/logout','POST',{});await boot();}));
 $('navigation').addEventListener('click',e=>{const button=e.target.closest('[data-view]');if(button)perform(()=>navigate(button.dataset.view));});
 $('day-filter').addEventListener('change',()=>perform(refreshOverview));
 $('month-filter').addEventListener('change',()=>perform(()=>navigate('reports')));
@@ -109,27 +109,17 @@ $('employee-table').addEventListener('click',e=>perform(async()=>{
   if(button.dataset.edit){const f=$('employee-form');f.reset();$('employee-id').value=employee.id;f.elements.name.value=employee.name;f.elements.code.value=employee.code.toUpperCase();f.elements.department.value=employee.department;$('employee-dialog-title').textContent='Edit employee';$('employee-dialog-note').textContent='Change employee identity or department.';$('pin-label').hidden=true;$('pin-help').hidden=true;f.elements.pin.required=false;$('employee-save').textContent='Save changes';$('employee-dialog').showModal();return;}
   if(button.dataset.pin){const pin=prompt(`Enter a new 4-digit PIN for ${employee.name}:`);if(pin===null)return;if(!/^\d{4}$/.test(pin))throw new Error('PIN must be exactly 4 digits.');await api('/api/employees/'+employee.id+'/reset-pin','POST',{pin});notice('Employee PIN reset.');return;}
   if(button.dataset.toggle){if(!confirm(`${employee.active?'Deactivate':'Activate'} ${employee.name}'s account?`))return;await api('/api/employees/'+employee.id+'/active','POST',{active:!employee.active});await refreshEmployees();notice('Employee access updated.');return;}
-  if(button.dataset.delete){if(!confirm(`Permanently remove ${employee.name}, including their attendance history and saved biometric credentials?`))return;await api('/api/employees/'+employee.id,'DELETE',{});await refreshEmployees();notice('Employee removed.');}
+  if(button.dataset.delete){if(!confirm(`Permanently remove ${employee.name}, including their attendance history?`))return;await api('/api/employees/'+employee.id,'DELETE',{});await refreshEmployees();notice('Employee removed.');}
 }));
 document.querySelectorAll('.close-dialog').forEach(button=>button.addEventListener('click',()=>button.closest('dialog').close()));
-function stopCamera(){cameraRun++;if(stream)stream.getTracks().forEach(track=>track.stop());stream=null;$('video').srcObject=null;}
-$('camera-dialog').addEventListener('close',stopCamera);
-window.addEventListener('pagehide',stopCamera);
-async function startCamera(mode){
-  stopCamera();const run=cameraRun;cameraMode=mode;challenge='';$('capture-button').disabled=true;$('consent').checked=false;
-  $('consent-label').hidden=!mode.employee;$('camera-title').textContent=mode.employee?'Register '+mode.employee.name:(mode.action==='out'?'Verify check-out':'Verify check-in');
-  $('camera-description').textContent=mode.employee?'Administrator: confirm the employee’s identity before enrolment.':'Face the camera. Your location will be captured when you submit.';
-  $('camera-status').textContent='Starting camera…';$('camera-dialog').showModal();
-  try{
-    if(!navigator.mediaDevices?.getUserMedia)throw new Error('Camera access requires HTTPS and a supported browser.');
-    const nextStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'user',width:{ideal:640},height:{ideal:480}},audio:false});
-    if(run!==cameraRun){nextStream.getTracks().forEach(t=>t.stop());return;}
-    stream=nextStream;$('video').srcObject=stream;await $('video').play();
-    if(!mode.employee)challenge=(await api('/api/capture','POST',{})).challenge;
-    if(run!==cameraRun)return;
-    $('camera-status').textContent='Camera ready. Keep your face inside the guide.';$('capture-button').textContent=mode.employee?'Capture and register':'Capture and verify';$('capture-button').disabled=false;
-  }catch(e){$('camera-status').textContent=e.name==='NotAllowedError'?'Camera permission denied. Allow camera access in your browser settings.':e.message;stopCamera();}
-}
+function getLocation(){return new Promise((resolve,reject)=>{
+  if(!navigator.geolocation)return reject(new Error('Location is not supported by this browser.'));
+  navigator.geolocation.getCurrentPosition(
+    p=>resolve({lat:p.coords.latitude,lng:p.coords.longitude,accuracy:p.coords.accuracy,timestamp:p.timestamp}),
+    ()=>reject(new Error('Unable to get location. Allow location access, enable GPS, and try again.')),
+    {enableHighAccuracy:true,timeout:20000,maximumAge:0}
+  );
+});}
 $('start-attendance').addEventListener('click',()=>perform(async()=>{
   await refreshMine();
   if($('start-attendance').disabled)return;
@@ -138,32 +128,6 @@ $('start-attendance').addEventListener('click',()=>perform(async()=>{
   await api('/api/attendance','POST',{action,location});
   await refreshMine();
   notice(action==='in'?'Checked in successfully. Have a good day.':'Checked out successfully.');
-}));
-  const credential=await navigator.credentials.get({publicKey:options});
-  if(!credential)throw new Error('Biometric verification was cancelled.');
-  await api('/api/attendance/biometric/verify','POST',{action,location,credential:credentialJSON(credential)});
-  await refreshMine();
-  notice(action==='in'?'Checked in successfully. Have a good day.':'Checked out successfully.');
-}));
-function getLocation(){return new Promise((resolve,reject)=>{
-  if(!navigator.geolocation)return reject(new Error('Location is not supported by this browser.'));
-  navigator.geolocation.getCurrentPosition(p=>resolve({lat:p.coords.latitude,lng:p.coords.longitude,accuracy:p.coords.accuracy,timestamp:p.timestamp}),()=>reject(new Error('Unable to get location. Allow location access, enable GPS, and try again.')),{enableHighAccuracy:true,timeout:20000,maximumAge:0});
-});}
-$('capture-button').addEventListener('click',()=>perform(async()=>{
-  const mode=cameraMode,run=cameraRun,button=$('capture-button');
-  if(mode.employee&&!$('consent').checked)throw new Error('Confirm employee consent before registering their face.');
-  if(!$('video').videoWidth)throw new Error('Camera is not ready. Try opening it again.');
-  button.disabled=true;
-  try{
-    let location;
-    if(!mode.employee){$('camera-status').textContent='Getting your current location…';location=await getLocation();if(run!==cameraRun)return;challenge=(await api('/api/capture','POST',{})).challenge;}
-    if(run!==cameraRun)return;
-    const canvas=document.createElement('canvas'),video=$('video'),scale=Math.min(1,800/video.videoWidth,800/video.videoHeight);
-    canvas.width=Math.round(video.videoWidth*scale);canvas.height=Math.round(video.videoHeight*scale);canvas.getContext('2d').drawImage(video,0,0,canvas.width,canvas.height);
-    const photo=canvas.toDataURL('image/jpeg',.85);$('camera-status').textContent='Verifying and saving…';
-    if(mode.employee){await api('/api/employees/'+mode.employee.id+'/enrol','POST',{photo,consent:true});$('camera-dialog').close();await refreshEmployees();notice('Face registered successfully.');}
-    else{await api('/api/attendance','POST',{photo,location,challenge,action:mode.action});$('camera-dialog').close();await refreshMine();notice(mode.action==='in'?'Checked in successfully. Have a good day.':'Checked out successfully.');}
-  }catch(e){$('camera-status').textContent=e.message;throw e;}finally{button.disabled=false;}
 }));
 async function attendanceAdminAction(e){
   const edit=e.target.closest('[data-attedit]'),del=e.target.closest('[data-attdelete]');if(!edit&&!del)return;
